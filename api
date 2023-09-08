@@ -1,0 +1,95 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+
+	"github.com/gorilla/mux"
+	"github.com/go-resty/resty/v2"
+)
+
+// ConversionRequest represents the request format
+type ConversionRequest struct {
+	Amount    float64   `json:"amount"`
+	From      string    `json:"from"`
+	To        []string  `json:"to"`
+}
+
+// ConversionResponse represents the response format
+type ConversionResponse struct {
+	Amount         float64                 `json:"amount"`
+	From           string                  `json:"from"`
+	ExchangeValues []ExchangeValueResponse `json:"exchangeValues"`
+}
+
+// ExchangeValueResponse represents the exchange value format
+type ExchangeValueResponse struct {
+	To    string  `json:"to"`
+	Value float64 `json:"value"`
+}
+
+func main() {
+	router := mux.NewRouter()
+	router.HandleFunc("/convert", ConvertCurrency).Methods("POST")
+
+	log.Fatal(http.ListenAndServe(":7850", router))
+}
+
+func ConvertCurrency(w http.ResponseWriter, r *http.Request) {
+	var conversionRequests []ConversionRequest
+	err := json.NewDecoder(r.Body).Decode(&conversionRequests)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var wg sync.WaitGroup
+	conversionResponses := make([]ConversionResponse, len(conversionRequests))
+
+	for i, request := range conversionRequests {
+		wg.Add(1)
+		go func(i int, request ConversionRequest) {
+			defer wg.Done()
+
+			// Fetch exchange values for each target currency
+			exchangeValues := make([]ExchangeValueResponse, len(request.To))
+			client := resty.New()
+
+			for j, targetCurrency := range request.To {
+				targetCurrency = strings.ToLower(targetCurrency)
+				resp, err := client.R().
+					Get(fmt.Sprintf("https://cdn.isdelivr.net/gh/fawazahmedo/currency-api@1/latest/currencies/%s/%s.json", strings.ToLower(request.From), targetCurrency))
+				if err != nil {
+					log.Printf("Error fetching exchange rate for %s to %s: %v", request.From, targetCurrency, err)
+					continue
+				}
+
+				var exchangeRateResponse map[string]float64
+				err = json.Unmarshal(resp.Body(), &exchangeRateResponse)
+				if err != nil {
+					log.Printf("Error parsing exchange rate response: %v", err)
+					continue
+				}
+
+				exchangeValue := exchangeRateResponse[targetCurrency]
+				exchangeValues[j] = ExchangeValueResponse{To: targetCurrency, Value: exchangeValue}
+			}
+
+			conversionResponses[i] = ConversionResponse{
+				Amount:         request.Amount,
+				From:           request.From,
+				ExchangeValues: exchangeValues,
+			}
+		}(i, request)
+	}
+
+	wg.Wait()
+
+	response := map[string][]ConversionResponse{"conversions": conversionResponses}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
